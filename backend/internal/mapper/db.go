@@ -29,6 +29,11 @@ const maxPageSize = 500
 const defaultUnpagedLimit = 500
 const sqliteMaxOpenConns = 12
 
+// sqliteBusyTimeoutMs 是等待 SQLite 写锁的超时时间。
+// 多个同步任务并发落库时写事务会相互排队，5s 在多任务场景下偏短，
+// 容易直接抛出 SQLITE_BUSY 让整个任务失败。
+const sqliteBusyTimeoutMs = 30000
+
 // InitDB initializes the database connection
 func InitDB() *sql.DB {
 	once.Do(func() {
@@ -46,7 +51,7 @@ func InitDB() *sql.DB {
 		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 			log.Printf("Failed to set sqlite journal_mode: %v", err)
 		}
-		if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		if _, err := db.Exec("PRAGMA busy_timeout=" + strconv.Itoa(sqliteBusyTimeoutMs)); err != nil {
 			log.Printf("Failed to set sqlite busy_timeout: %v", err)
 		}
 		for _, pragma := range []string{"PRAGMA foreign_keys=ON", "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-16384", "PRAGMA mmap_size=67108864"} {
@@ -102,8 +107,13 @@ func sqliteDSN(dbName string) string {
 		return dbName
 	}
 	pragmas := url.Values{}
-	pragmas.Add("_pragma", "busy_timeout(5000)")
+	pragmas.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMs))
 	pragmas.Add("_pragma", "journal_mode(WAL)")
+	// 写事务以 IMMEDIATE 模式开启。WAL 下延迟事务（deferred）在需要从读锁
+	// 升级为写锁时不会等待 busy_timeout，而是立刻返回 SQLITE_BUSY，
+	// 导致并发任务的批量落库直接失败。IMMEDIATE 会在 BEGIN 时就取写锁，
+	// 从而让 busy_timeout 真正生效。
+	pragmas.Add("_txlock", "immediate")
 	query := pragmas.Encode()
 	if strings.HasPrefix(dbName, "file:") {
 		sep := "?"
